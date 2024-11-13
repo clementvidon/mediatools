@@ -1,0 +1,142 @@
+#!/bin/bash
+
+# @author       clemedon (Clément Vidon)
+# @brief        Rename images based on creation date, file size, and a user-defined prefix
+# @usage        ./rename_images.sh /path/to/directory "MY_PREFIX" [ "ext1,ext2" ]
+# @dependency   Requires exiftool
+
+# Ensure exiftool is installed
+if ! command -v exiftool &> /dev/null; then
+    echo "exiftool is required but not installed. Please install it and try again."
+    exit 1
+fi
+
+# Determine the stat command based on the operating system
+if [[ "$(uname)" == "Darwin" ]]; then
+    STAT_CMD="stat -f%z"
+elif [[ "$(uname)" == "Linux" ]]; then
+    STAT_CMD="stat -c%s"
+else
+    echo "Unsupported operating system."
+    exit 1
+fi
+
+# Validate input arguments
+if [ -z "$1" ] || [ -z "$2" ]; then
+    echo "Usage: $0 /path/to/directory PREFIX [ ext1,ext2 ]"
+    exit 1
+fi
+
+# Set target directory, prefix, and date for logs
+target_dir="$1"
+prefix="$2"
+log_date=$(date +"%y%m%d%H%M%S")
+log_file="/tmp/rename_images_${log_date}.log"
+undo_script="$target_dir/.undo_rename_images.sh"
+echo "# ---------- $log_date ----------" >> "$undo_script"
+chmod +x "$undo_script"
+
+# Build the file list based on optional extensions
+file_list=()
+if [ -n "$3" ]; then
+    IFS=',' read -r -a extensions <<< "${3^^}"
+    ext_pattern=$(printf "-iname '*.%s' " "${extensions[@]}")
+    find_cmd="find '$target_dir' -type f ! -name '.*' \\( $ext_pattern \\) -print0"
+else
+    find_cmd="find '$target_dir' -type f ! -name '.*' -print0"
+fi
+
+# Execute the find command and build the file list
+while IFS= read -r -d '' file; do
+    file_list+=("$file")
+done < <(eval "$find_cmd")
+
+# Print failure message
+print_failure() {
+    echo -e "\033[31m$1\033[0m"
+}
+
+# Function to store the original filename in UserComment metadata
+store_original_filename() {
+    local file="$1"
+    local original_name="$2"
+    local sanitized_name=$(echo "$original_name" | tr -cd '[:print:]' | tr '\t' ' ' | sed 's/[^a-zA-Z0-9._-]/_/g' | cut -c1-200)
+
+    if ! exiftool -UserComment "$file" 2>/dev/null | grep -q "originalfilename"; then
+        exiftool -overwrite_original -UserComment="originalfilename_$(date +"%y%m%d")=$sanitized_name" "$file" > /dev/null 2>&1
+    fi
+}
+
+# Function to update EXIF DateTimeOriginal and FileCreateDate
+update_exif_dates() {
+    local file="$1"
+    local filename=$(basename "$file")
+
+    if [[ "$filename" =~ ^${prefix}([0-9]{2})_([0-9]{2})([0-9]{2})_([0-9]{6})_ ]]; then
+        year="20${BASH_REMATCH[1]}"
+        month="${BASH_REMATCH[2]}"
+        day="${BASH_REMATCH[3]}"
+        time="${BASH_REMATCH[4]}"
+        formatted_date="${year}:${month}:${day} ${time:0:2}:${time:2:2}:${time:4:2}"
+
+        exiftool -overwrite_original -DateTimeOriginal="$formatted_date" -FileCreateDate="$formatted_date" "$file" > /dev/null 2>&1
+    fi
+}
+
+# Process each file in the list
+total_files=${#file_list[@]}
+processed=0
+success=0
+failures=0
+
+for f in "${file_list[@]}"; do
+    ((processed++))
+    basename_f=$(basename "$f")
+
+    # Skip unreadable, empty, or non-writable files
+    if [ ! -r "$f" ] || [ ! -s "$f" ] || [ ! -w "$f" ]; then
+        ((failures++))
+        print_failure "$processed/$total_files failure: '$basename_f' is unreadable, empty, or not writable"
+        continue
+    fi
+
+    # Extract creation date from EXIF metadata
+    date_tags=("DateTimeOriginal" "CreateDate" "MediaCreateDate" "FileCreateDate" "ModifyDate")
+    exif_date=""
+    for tag in "${date_tags[@]}"; do
+        exif_date=$(exiftool -m -s3 -$tag -d "%y%m%d%H%M%S" "$f")
+        if [[ "$exif_date" =~ ^[0-9]{12}$ ]]; then
+            break
+        fi
+    done
+
+    # Fallback to file modification time if no EXIF date is found
+    if [ -z "$exif_date" ]; then
+        exif_date=$(date +"%y%m%d%H%M%S" -d "@$(stat -c "%Y" "$f")")
+    fi
+
+    # Construct the new filename
+    ext="${f##*.}"
+    bytes=$(printf "%08d" "$($STAT_CMD "$f")")
+    newfile="$target_dir/${prefix}${exif_date:0:2}_${exif_date:2:2}${exif_date:4:2}_${exif_date:6:6}_${bytes}.${ext^^}"
+
+    if [ -e "$newfile" ]; then
+        ((failures++))
+        print_failure "$processed/$total_files failure: target file '$newfile' already exists"
+        continue
+    fi
+
+    if mv -v "$f" "$newfile" &>>"$log_file"; then
+        echo "$processed/$total_files success: renamed '$basename_f' -> '$newfile'"
+        echo "mv -v \"$newfile\" \"$f\"" >> "$undo_script"
+        store_original_filename "$newfile" "$basename_f"
+        update_exif_dates "$newfile"
+        ((success++))
+    else
+        ((failures++))
+        print_failure "$processed/$total_files failure: could not rename '$basename_f'"
+    fi
+done
+
+# Summary
+echo "Renaming complete: $success successful, $failures failed."
