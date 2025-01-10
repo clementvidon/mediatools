@@ -1,0 +1,208 @@
+#!/bin/bash
+
+###############################################################################
+# 1) Script Information
+###############################################################################
+# @author       clemedon (Clément Vidon)
+# @brief        Rename files based on creation date, file size, and a user-defined prefix
+# @usage        ./nameasdate -dir="DIR_PATH" -prefix="MYPREFIX" -ext="EXTENSION"
+# @dependency   Requires exiftool
+
+###############################################################################
+# 2) Validate exiftool installation
+###############################################################################
+if ! command -v exiftool &> /dev/null; then
+    echo "exiftool is required but not installed. Please install it and try again."
+    exit 1
+fi
+
+###############################################################################
+# 3) Determine stat command based on the OS
+###############################################################################
+if [[ "$(uname)" == "Darwin" ]]; then
+    STAT_CMD="stat -f%z"
+elif [[ "$(uname)" == "Linux" ]]; then
+    STAT_CMD="stat -c%s"
+else
+    echo "Unsupported operating system."
+    exit 1
+fi
+
+###############################################################################
+# 4) Parse flag-style parameters
+###############################################################################
+usage() {
+    echo "Usage: $0 -dir=\"path_to_directory\" -prefix=\"name_prefix\" -ext=\"target_files_extension\""
+    echo "Example: $0 -dir=\".\" -prefix=\"GR3_CV\" -ext=\"DNG\""
+    exit 1
+}
+
+# Initialize variables
+target_dir=""
+prefix=""
+extension=""
+
+# Parse each argument
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -dir=*)
+            target_dir="${1#*=}"
+            ;;
+        -prefix=*)
+            prefix="${1#*=}"
+            ;;
+        -ext=*)
+            extension="${1#*=}"
+            ;;
+        -h|--help)
+            usage
+            ;;
+        *)
+            echo "Unknown option: $1"
+            usage
+            ;;
+    esac
+    shift
+done
+
+# Validate required arguments
+if [ -z "$target_dir" ] || [ -z "$prefix" ] || [ -z "$extension" ]; then
+    echo "Error: -dir, -prefix, and -ext flags are required."
+    usage
+fi
+
+###############################################################################
+# 5) Prepare logging and undo script
+###############################################################################
+log_date=$(date +"%y%m%d%H%M%S")
+log_file="/tmp/nameasdate_${log_date}.log"
+undo_script="$target_dir/.undo_nameasdate.sh"
+echo "# ---------- $log_date ----------" >> "$undo_script"
+chmod +x "$undo_script"
+
+###############################################################################
+# 6) Build find command for the single mandatory extension
+###############################################################################
+# Convert extension to lowercase (or uppercase if you prefer)
+extension="${extension,,}"
+find_cmd="find \"$target_dir\" -type f ! -name '.*' -iname \"*.$extension\" -print0"
+
+###############################################################################
+# 7) Execute find command and collect files
+###############################################################################
+file_list=()
+while IFS= read -r -d '' file; do
+    file_list+=("$file")
+done < <(eval "$find_cmd")
+
+###############################################################################
+# 8) Helper functions
+###############################################################################
+print_failure() {
+    echo -e "\033[31m$1\033[0m"
+}
+
+store_original_filename() {
+    local file="$1"
+    local original_name="$2"
+    local sanitized_name
+    sanitized_name="$(echo "$original_name" \
+        | tr -cd '[:print:]' \
+        | tr '\t' ' ' \
+        | sed 's/[^a-zA-Z0-9._-]/_/g' \
+        | cut -c1-200)"
+
+    if ! exiftool -UserComment "$file" 2>/dev/null | grep -q "originalfilename"; then
+        exiftool -overwrite_original \
+                 -UserComment="originalfilename_$(date +"%y%m%d")=$sanitized_name" \
+                 "$file" > /dev/null 2>&1
+    fi
+}
+
+update_exif_dates() {
+    local file="$1"
+    local filename
+    filename="$(basename "$file")"
+
+    # If the file name matches the pattern: prefixYY_MMDD_HHMMSS_XXXXXXXX.EXT
+    if [[ "$filename" =~ ^${prefix}([0-9]{2})_([0-9]{2})([0-9]{2})_([0-9]{6})_ ]]; then
+        local year="20${BASH_REMATCH[1]}"
+        local month="${BASH_REMATCH[2]}"
+        local day="${BASH_REMATCH[3]}"
+        local time="${BASH_REMATCH[4]}"
+        local formatted_date="${year}:${month}:${day} ${time:0:2}:${time:2:2}:${time:4:2}"
+
+        exiftool -overwrite_original \
+                 -DateTimeOriginal="$formatted_date" \
+                 -FileCreateDate="$formatted_date" \
+                 "$file" > /dev/null 2>&1
+    fi
+}
+
+###############################################################################
+# 9) Main loop: rename files
+###############################################################################
+total_files=${#file_list[@]}
+processed=0
+success=0
+failures=0
+
+for f in "${file_list[@]}"; do
+    ((processed++))
+    basename_f=$(basename "$f")
+
+    # Skip unreadable, empty, or non-writable files
+    if [ ! -r "$f" ] || [ ! -s "$f" ] || [ ! -w "$f" ]; then
+        ((failures++))
+        print_failure "$processed/$total_files failure: '$basename_f' is unreadable, empty, or not writable"
+        continue
+    fi
+
+    # Extract creation date from EXIF metadata
+    date_tags=("DateTimeOriginal" "CreateDate" "MediaCreateDate" "FileCreateDate" "ModifyDate")
+    exif_date=""
+
+    for tag in "${date_tags[@]}"; do
+        exif_date=$(exiftool -m -s3 -$tag -d "%y%m%d%H%M%S" "$f")
+        if [[ "$exif_date" =~ ^[0-9]{12}$ ]]; then
+            break
+        fi
+    done
+
+    # Fallback to file modification time if no EXIF date
+    if [ -z "$exif_date" ]; then
+        exif_date=$(date +"%y%m%d%H%M%S" -d "@$(stat -c "%Y" "$f")")
+    fi
+
+    # Construct the new file name
+    ext="${f##*.}"
+    bytes=$(printf "%08d" "$($STAT_CMD "$f")")
+    newfile="$target_dir/${prefix}${exif_date:0:2}_${exif_date:2:2}${exif_date:4:2}_${exif_date:6:6}_${bytes}.${ext^^}"
+
+    # Check if it already exists
+    if [ -e "$newfile" ]; then
+        ((failures++))
+        print_failure "$processed/$total_files failure: target file '$newfile' already exists"
+        continue
+    fi
+
+    # Attempt the rename
+    if mv -v "$f" "$newfile" &>>"$log_file"; then
+        echo "$processed/$total_files success: renamed '$basename_f' -> '$newfile'"
+        # Write undo command
+        echo "mv -v \"$newfile\" \"$f\"" >> "$undo_script"
+        # Store original filename in metadata
+        store_original_filename "$newfile" "$basename_f"
+        # Update EXIF dates from the new filename
+        update_exif_dates "$newfile"
+        ((success++))
+    else
+        ((failures++))
+        print_failure "$processed/$total_files failure: could not rename '$basename_f'"
+    fi
+done
+
+###############################################################################
+# 10) Summary
+###############################################################################
+echo "Renaming complete: $success successful, $failures failed."
