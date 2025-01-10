@@ -5,7 +5,7 @@
 ###############################################################################
 # @author       clemedon (Clément Vidon)
 # @brief        Rename files based on creation date, file size, and a user-defined prefix
-# @usage        ./nameasdate -dir="DIR_PATH" -prefix="MYPREFIX" -ext="EXTENSION"
+# @usage        ./exifname -dir="DIR_PATH" -prefix="MYPREFIX" -ext="EXTENSION"
 # @dependency   Requires exiftool
 
 ###############################################################################
@@ -32,15 +32,17 @@ fi
 # 4) Parse flag-style parameters
 ###############################################################################
 usage() {
-    echo "Usage: $0 -dir=\"path_to_directory\" -prefix=\"name_prefix\" -ext=\"target_files_extension\""
-    echo "Example: $0 -dir=\".\" -prefix=\"GR3_CV\" -ext=\"DNG\""
+    echo "USAGE"
+    echo "         $0 -dir=PATH_TO_DIRECTORY -ext=TARGET_FILES_EXTENSION -prefix=NAME_PREFIX"
+    echo "EXAMPLE"
+    echo "         $0 -dir=. -ext=dng -prefix=GR3_CV"
     exit 1
 }
 
 # Initialize variables
 target_dir=""
-prefix=""
 extension=""
+prefix=""
 
 # Parse each argument
 while [[ $# -gt 0 ]]; do
@@ -48,11 +50,11 @@ while [[ $# -gt 0 ]]; do
         -dir=*)
             target_dir="${1#*=}"
             ;;
-        -prefix=*)
-            prefix="${1#*=}"
-            ;;
         -ext=*)
             extension="${1#*=}"
+            ;;
+        -prefix=*)
+            prefix="${1#*=}"
             ;;
         -h|--help)
             usage
@@ -67,7 +69,6 @@ done
 
 # Validate required arguments
 if [ -z "$target_dir" ] || [ -z "$prefix" ] || [ -z "$extension" ]; then
-    echo "Error: -dir, -prefix, and -ext flags are required."
     usage
 fi
 
@@ -75,8 +76,8 @@ fi
 # 5) Prepare logging and undo script
 ###############################################################################
 log_date=$(date +"%y%m%d%H%M%S")
-log_file="/tmp/nameasdate_${log_date}.log"
-undo_script="$target_dir/.undo_nameasdate.sh"
+log_file="/tmp/exifname_${log_date}.log"
+undo_script="$target_dir/.undo_exifname.sh"
 echo "# ---------- $log_date ----------" >> "$undo_script"
 chmod +x "$undo_script"
 
