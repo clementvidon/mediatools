@@ -5,7 +5,7 @@
 ###############################################################################
 # @author       clemedon (Clément Vidon)
 # @brief        Rename files based on creation date, file size, and a user-defined prefix
-# @usage        ./exifname -dir="DIR_PATH" -prefix="MYPREFIX" -ext="EXTENSION"
+# @usage        ./media-rename -dir="DIR_PATH" -prefix="MYPREFIX" -ext="EXTENSION"
 # @dependency   Requires exiftool
 
 ###############################################################################
@@ -76,8 +76,8 @@ fi
 # 5) Prepare logging and undo script
 ###############################################################################
 log_date=$(date +"%y%m%d%H%M%S")
-log_file="/tmp/exifname_${log_date}.log"
-undo_script="$target_dir/.undo_exifname.sh"
+log_file="/tmp/media-rename_${log_date}.log"
+undo_script="$target_dir/.undo_media-rename.sh"
 echo "# ---------- $log_date ----------" >> "$undo_script"
 chmod +x "$undo_script"
 
