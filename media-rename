@@ -36,6 +36,8 @@ usage() {
     echo "         $0 -dir=PATH_TO_DIRECTORY -ext=TARGET_FILES_EXTENSION -prefix=NAME_PREFIX"
     echo "EXAMPLE"
     echo "         $0 -dir=. -ext=dng -prefix=GR3_CV"
+    echo "INFO"
+    echo "         -ext= is case insensitive"
     exit 1
 }
 
@@ -115,8 +117,8 @@ store_original_filename() {
 
     if ! exiftool -UserComment "$file" 2>/dev/null | grep -q "originalfilename"; then
         exiftool -overwrite_original \
-                 -UserComment="originalfilename_$(date +"%y%m%d")=$sanitized_name" \
-                 "$file" > /dev/null 2>&1
+            -UserComment="originalfilename_$(date +"%y%m%d")=$sanitized_name" \
+            "$file" > /dev/null 2>&1
     fi
 }
 
@@ -134,9 +136,9 @@ update_exif_dates() {
         local formatted_date="${year}:${month}:${day} ${time:0:2}:${time:2:2}:${time:4:2}"
 
         exiftool -overwrite_original \
-                 -DateTimeOriginal="$formatted_date" \
-                 -FileCreateDate="$formatted_date" \
-                 "$file" > /dev/null 2>&1
+            -DateTimeOriginal="$formatted_date" \
+            -FileCreateDate="$formatted_date" \
+            "$file" > /dev/null 2>&1
     fi
 }
 
@@ -164,16 +166,24 @@ for f in "${file_list[@]}"; do
     exif_date=""
 
     for tag in "${date_tags[@]}"; do
-        exif_date=$(exiftool -m -s3 -$tag -d "%y%m%d%H%M%S" "$f")
-        if [[ "$exif_date" =~ ^[0-9]{12}$ ]]; then
+        val=$(exiftool -m -s3 -$tag -d "%y%m%d%H%M%S" "$f")
+        if [[ "$val" =~ ^[0-9]{12}$ ]] && [[ "$val" != "000000000000" ]]; then
+            exif_date="$val"
             break
         fi
     done
 
     # Fallback to file modification time if no EXIF date
     if [ -z "$exif_date" ]; then
-        exif_date=$(date +"%y%m%d%H%M%S" -d "@$(stat -c "%Y" "$f")")
+        # Modif pour compatibilité MacOS/Linux
+        if [[ "$(uname)" == "Darwin" ]]; then
+            file_epoch=$(stat -f "%m" "$f")
+        else
+            file_epoch=$(stat -c "%Y" "$f")
+        fi
+        exif_date=$(date +"%y%m%d%H%M%S" -d "@$file_epoch")
     fi
+
 
     # Construct the new file name
     ext="${f##*.}"
