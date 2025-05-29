@@ -1,35 +1,43 @@
 #!/bin/bash
 
-# Prerequisites: imagemagick
+# Create a directory for resized images if it doesn't exist
+mkdir -p resized_images
 
-# Check if the maximum side size and at least one image are provided
-if [ "$#" -lt 2 ]; then
-  echo "Usage: $0 <max_size> <image1> [<image2> ...]"
-  exit 1
-fi
+# Loop through all JPG files in the current directory
+for img in *.jpg; do
+  # Check if the image size is greater than 2MB (2000000 bytes)
+  if [ $(stat -c%s "$img") -gt 2000000 ]; then
+    echo "Resizing $img..."
 
-# Get the maximum size from the first argument
-max_size=$1
-shift # Remove the max_size argument from the list of arguments
+    # Set initial quality
+    quality=100
 
-# Loop through all the remaining arguments (image files)
-for img in "$@"; do
-  # Check if the file exists and is a JPG/JPEG file
-  if [ -f "$img" ] && [[ "$img" == *.JPG || "$img" == *.jpg || "$img" == *.jpeg ]]; then
-    echo -n "Resizing $img.."
+    # Start resizing the image
+    convert "$img" -quality $quality "resized_images/$img"
 
-    # Get the directory and filename separately
-    dir=$(dirname "$img")
-    filename=$(basename "$img")
+    # Loop to reduce quality until the image is under 2MB
+    while [ $(stat -c%s "resized_images/$img") -gt 2000000 ]; do
+      # Reduce quality in steps of 5
+      quality=$((quality - 5))
 
-    # Use ImageMagick's convert to resize the image
-    # Resize the image so that the largest dimension matches max_size and the aspect ratio is maintained
-    convert "$img" -resize "${max_size}x${max_size}>" "$dir/small_$filename"
+      # Convert the image with the current quality setting
+      convert "$img" -quality $quality "resized_images/$img"
 
-    echo ". DONE"
+      # Check if the quality is too low
+      if [ $quality -le 10 ]; then
+        echo "Warning: Unable to resize $img to under 2MB without reducing quality too much."
+        break
+      fi
+    done
+
+    # Output the final size and quality used
+    echo "$img resized to $(stat -c%s "resized_images/$img") bytes using quality $quality."
   else
-    echo "File $img not found or is not a JPG/JPEG file"
+    # Copy images that are already under 2MB without modification
+    cp "$img" "resized_images/$img"
+    echo "$img is already under 2MB, copied without changes."
   fi
 done
 
-echo "Resizing process completed"
+echo "Resizing process completed."
+

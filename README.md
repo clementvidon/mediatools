@@ -6,10 +6,10 @@ Default media files permissions: `$ chmod 644 *`
 
 Default media files: ownership: `$ sudo chown $USER:$USER *`
 
-1. Use **media_rename** to give a consistent and unique name to your files.
-2. Use **media_check** to detect corrupted files.
-3. Use **video_reencode** to attempt to fix corrupted video files.
-4. Use **jpg_resize** to resize jpg files.
+1. Use **reset-and-rename** to give a consistent and unique name to your files.
+2. Use **media-check** to detect corrupted files.
+3. Use **video-reencode** to attempt to fix corrupted video files.
+4. Use **jpg-resize** to resize jpg files.
 
 ## Tools
 

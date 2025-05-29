@@ -4,7 +4,7 @@
 # 1) Script Information
 ###############################################################################
 # @author       clemedon (Clément Vidon)
-# @brief        Rename files based on creation date, file size, and a user-defined prefix
+# @brief        Prune exifs data and rename files based on creation date, file size, and a user-defined prefix
 # @usage        ./media-rename -dir="DIR_PATH" -prefix="MYPREFIX" -ext="EXTENSION"
 # @dependency   Requires exiftool
 
@@ -79,14 +79,13 @@ fi
 ###############################################################################
 log_date=$(date +"%y%m%d%H%M%S")
 log_file="/tmp/media-rename_${log_date}.log"
-undo_script="$target_dir/.undo_media-rename.sh"
+undo_script="/tmp/media-rename-undo-$log_date.sh"
 echo "# ---------- $log_date ----------" >> "$undo_script"
 chmod +x "$undo_script"
 
 ###############################################################################
 # 6) Build find command for the single mandatory extension
 ###############################################################################
-# Convert extension to lowercase (or uppercase if you prefer)
 extension="${extension,,}"
 find_cmd="find \"$target_dir\" -type f ! -name '.*' -iname \"*.$extension\" -print0"
 
@@ -99,56 +98,16 @@ while IFS= read -r -d '' file; do
 done < <(eval "$find_cmd")
 
 ###############################################################################
-# 8) Helper functions
-###############################################################################
-print_failure() {
-    echo -e "\033[31m$1\033[0m"
-}
-
-store_original_filename() {
-    local file="$1"
-    local original_name="$2"
-    local sanitized_name
-    sanitized_name="$(echo "$original_name" \
-        | tr -cd '[:print:]' \
-        | tr '\t' ' ' \
-        | sed 's/[^a-zA-Z0-9._-]/_/g' \
-        | cut -c1-200)"
-
-    if ! exiftool -UserComment "$file" 2>/dev/null | grep -q "originalfilename"; then
-        exiftool -overwrite_original \
-            -UserComment="originalfilename_$(date +"%y%m%d")=$sanitized_name" \
-            "$file" > /dev/null 2>&1
-    fi
-}
-
-update_exif_dates() {
-    local file="$1"
-    local filename
-    filename="$(basename "$file")"
-
-    # If the file name matches the pattern: prefixYY_MMDD_HHMMSS_XXXXXXXX.EXT
-    if [[ "$filename" =~ ^${prefix}([0-9]{2})_([0-9]{2})([0-9]{2})_([0-9]{6})_ ]]; then
-        local year="20${BASH_REMATCH[1]}"
-        local month="${BASH_REMATCH[2]}"
-        local day="${BASH_REMATCH[3]}"
-        local time="${BASH_REMATCH[4]}"
-        local formatted_date="${year}:${month}:${day} ${time:0:2}:${time:2:2}:${time:4:2}"
-
-        exiftool -overwrite_original \
-            -DateTimeOriginal="$formatted_date" \
-            -FileCreateDate="$formatted_date" \
-            "$file" > /dev/null 2>&1
-    fi
-}
-
-###############################################################################
-# 9) Main loop: rename files
+# 8) Main loop: metadata clean + set, THEN compute and rename
 ###############################################################################
 total_files=${#file_list[@]}
 processed=0
 success=0
 failures=0
+
+print_failure() {
+    echo -e "\033[31m$1\033[0m"
+}
 
 for f in "${file_list[@]}"; do
     ((processed++))
@@ -161,10 +120,9 @@ for f in "${file_list[@]}"; do
         continue
     fi
 
-    # Extract creation date from EXIF metadata
+    # Extraire la date EXIF (au format yymmddHHMMSS)
     date_tags=("DateTimeOriginal" "CreateDate" "MediaCreateDate" "FileCreateDate" "ModifyDate")
     exif_date=""
-
     for tag in "${date_tags[@]}"; do
         val=$(exiftool -m -s3 -$tag -d "%y%m%d%H%M%S" "$f")
         if [[ "$val" =~ ^[0-9]{12}$ ]] && [[ "$val" != "000000000000" ]]; then
@@ -173,9 +131,8 @@ for f in "${file_list[@]}"; do
         fi
     done
 
-    # Fallback to file modification time if no EXIF date
+    # Fallback sur file mtime si aucune date trouvée
     if [ -z "$exif_date" ]; then
-        # Modif pour compatibilité MacOS/Linux
         if [[ "$(uname)" == "Darwin" ]]; then
             file_epoch=$(stat -f "%m" "$f")
         else
@@ -184,28 +141,61 @@ for f in "${file_list[@]}"; do
         exif_date=$(date +"%y%m%d%H%M%S" -d "@$file_epoch")
     fi
 
+    # Formatte la date pour EXIF (YYYY:MM:DD HH:MM:SS)
+    year="20${exif_date:0:2}"
+    month="${exif_date:2:2}"
+    day="${exif_date:4:2}"
+    hour="${exif_date:6:2}"
+    min="${exif_date:8:2}"
+    sec="${exif_date:10:2}"
+    formatted_date="${year}:${month}:${day} ${hour}:${min}:${sec}"
 
-    # Construct the new file name
+    # Nettoie le nom original pour metadata
+    sanitized_name="$(echo "$basename_f" \
+        | tr -cd '[:print:]' \
+        | tr '\t' ' ' \
+        | sed 's/[^a-zA-Z0-9._-]/_/g' \
+        | cut -c1-200)"
+
+    # Vérifie si UserComment existe déjà (évite de l'écraser à chaque fois)
+    if ! exiftool -UserComment "$f" 2>/dev/null | grep -q "originalfilename"; then
+        exiftool -overwrite_original \
+            -trailer:all= \
+            -UserComment="originalfilename_$(date +%y%m%d)=$sanitized_name" \
+            -DateTimeOriginal="$formatted_date" \
+            -FileCreateDate="$formatted_date" \
+            "$f" > /dev/null 2>&1
+    else
+        exiftool -overwrite_original \
+            -trailer:all= \
+            -DateTimeOriginal="$formatted_date" \
+            -FileCreateDate="$formatted_date" \
+            "$f" > /dev/null 2>&1
+    fi
+
+    # Calcul du nom FINAL (après toutes les modifs metadata !)
     ext="${f##*.}"
     bytes=$(printf "%08d" "$($STAT_CMD "$f")")
     newfile="$target_dir/${prefix}${exif_date:0:2}_${exif_date:2:2}${exif_date:4:2}_${exif_date:6:6}_${bytes}.${ext^^}"
 
-    # Check if it already exists
+    # Si déjà au bon nom, skip
+    if [ "$(realpath "$f")" == "$(realpath "$newfile")" ]; then
+        echo "$processed/$total_files already named '$newfile'"
+        ((success++))
+        continue
+    fi
+
+    # Si fichier cible existe déjà (collision)
     if [ -e "$newfile" ]; then
         ((failures++))
         print_failure "$processed/$total_files failure: target file '$newfile' already exists"
         continue
     fi
 
-    # Attempt the rename
+    # Renomme
     if mv -v "$f" "$newfile" &>>"$log_file"; then
-        echo "$processed/$total_files success: renamed '$basename_f' -> '$newfile'"
-        # Write undo command
+        echo "$processed/$total_files success: created '$newfile' from '$basename_f'"
         echo "mv -v \"$newfile\" \"$f\"" >> "$undo_script"
-        # Store original filename in metadata
-        store_original_filename "$newfile" "$basename_f"
-        # Update EXIF dates from the new filename
-        update_exif_dates "$newfile"
         ((success++))
     else
         ((failures++))
