@@ -87,7 +87,7 @@ chmod +x "$undo_script"
 # 6) Build find command for the single mandatory extension
 ###############################################################################
 extension="${extension,,}"
-find_cmd="find \"$target_dir\" -type f ! -name '.*' -iname \"*.$extension\" -print0"
+find_cmd="find \"$target_dir\" -maxdepth 1 -type f ! -name '.*' -iname \"*.$extension\" -print0"
 
 ###############################################################################
 # 7) Execute find command and collect files
@@ -124,6 +124,7 @@ for f in "${file_list[@]}"; do
     date_tags=("DateTimeOriginal" "CreateDate" "MediaCreateDate" "FileCreateDate" "ModifyDate")
     exif_date=""
     for tag in "${date_tags[@]}"; do
+        source_tag="$tag"
         val=$(exiftool -m -s3 -$tag -d "%y%m%d%H%M%S" "$f")
         if [[ "$val" =~ ^[0-9]{12}$ ]] && [[ "$val" != "000000000000" ]]; then
             exif_date="$val"
@@ -131,7 +132,7 @@ for f in "${file_list[@]}"; do
         fi
     done
 
-    # Fallback sur file mtime si aucune date trouvée
+    # Fallback sur file mtime si aucune date trouvée (date_tags order or priority)
     if [ -z "$exif_date" ]; then
         if [[ "$(uname)" == "Darwin" ]]; then
             file_epoch=$(stat -f "%m" "$f")
@@ -139,6 +140,7 @@ for f in "${file_list[@]}"; do
             file_epoch=$(stat -c "%Y" "$f")
         fi
         exif_date=$(date +"%y%m%d%H%M%S" -d "@$file_epoch")
+        source_tag="file_mtime"
     fi
 
     # Formatte la date pour EXIF (YYYY:MM:DD HH:MM:SS)
@@ -163,12 +165,14 @@ for f in "${file_list[@]}"; do
             -trailer:all= \
             -UserComment="originalfilename_$(date +%y%m%d)=$sanitized_name" \
             -DateTimeOriginal="$formatted_date" \
+            -CreateDate="$formatted_date" \
             -FileCreateDate="$formatted_date" \
             "$f" > /dev/null 2>&1
     else
         exiftool -overwrite_original \
             -trailer:all= \
             -DateTimeOriginal="$formatted_date" \
+            -CreateDate="$formatted_date" \
             -FileCreateDate="$formatted_date" \
             "$f" > /dev/null 2>&1
     fi
@@ -201,9 +205,10 @@ for f in "${file_list[@]}"; do
         ((failures++))
         print_failure "$processed/$total_files failure: could not rename '$basename_f'"
     fi
+    echo "$processed/$total_files - $basename_f: date source = $source_tag" >> "$log_file"
 done
 
 ###############################################################################
 # 10) Summary
 ###############################################################################
-echo "Renaming complete: $success successful, $failures failed."
+echo "Renaming complete: $success successful, $failures failed.\nSee logs in: $log_file"
