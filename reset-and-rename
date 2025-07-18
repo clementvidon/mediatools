@@ -17,16 +17,28 @@ if ! command -v exiftool &> /dev/null; then
 fi
 
 ###############################################################################
-# 3) Determine stat command based on the OS
+# 3) Determine stat command and date formatting based on the OS
 ###############################################################################
-if [[ "$(uname)" == "Darwin" ]]; then
+
+OS_NAME=$(uname)
+
+if [[ "$OS_NAME" == "Darwin" ]]; then
     STAT_CMD="stat -f%z"
-elif [[ "$(uname)" == "Linux" ]]; then
+elif [[ "$OS_NAME" == "Linux" ]]; then
     STAT_CMD="stat -c%s"
 else
     echo "Unsupported operating system."
     exit 1
 fi
+
+format_touch_date() {
+    input="$1"
+    if [[ "$OS_NAME" == "Darwin" ]]; then
+        date -j -f "%Y:%m:%d %H:%M:%S" "$input" +"%Y%m%d%H%M.%S"
+    else
+        date -d "$input" +"%Y%m%d%H%M.%S"
+    fi
+}
 
 ###############################################################################
 # 4) Parse flag-style parameters
@@ -134,7 +146,7 @@ for f in "${file_list[@]}"; do
 
     # Fallback sur file mtime si aucune date trouvée (date_tags order or priority)
     if [ -z "$exif_date" ]; then
-        if [[ "$(uname)" == "Darwin" ]]; then
+        if [[ "$OS_NAME" == "Darwin" ]]; then
             file_epoch=$(stat -f "%m" "$f")
         else
             file_epoch=$(stat -c "%Y" "$f")
@@ -199,6 +211,18 @@ for f in "${file_list[@]}"; do
     # Renomme
     if mv -v "$f" "$newfile" &>>"$log_file"; then
         echo "$processed/$total_files success: created '$newfile' from '$basename_f'"
+
+        # --- Harmonise TrackCreateDate / TrackModifyDate ---
+        exiftool -overwrite_original \
+            -TrackCreateDate="$formatted_date" \
+            -TrackModifyDate="$formatted_date" \
+            "$newfile" > /dev/null 2>&1
+
+        # --- Remet File Modification Date au formatted_date ---
+        # Conversion en format attendu par `touch`
+        touch_date=$(format_touch_date "$formatted_date")
+        touch -t "$touch_date" "$newfile"
+
         echo "mv -v \"$newfile\" \"$f\"" >> "$undo_script"
         ((success++))
     else
@@ -211,4 +235,5 @@ done
 ###############################################################################
 # 10) Summary
 ###############################################################################
-echo "Renaming complete: $success successful, $failures failed.\nSee logs in: $log_file"
+echo "Renaming complete: $success successful, $failures failed."
+echo "See logs in: $log_file"
