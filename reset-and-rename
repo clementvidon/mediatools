@@ -36,7 +36,11 @@ format_touch_date() {
     if [[ "$OS_NAME" == "Darwin" ]]; then
         date -j -f "%Y:%m:%d %H:%M:%S" "$input" +"%Y%m%d%H%M.%S"
     else
-        date -d "$input" +"%Y%m%d%H%M.%S"
+        date_part="${input%% *}"
+        time_part="${input##* }"
+        date_part_clean="${date_part//:/-}"
+        reformatted="${date_part_clean} ${time_part}"
+        date -d "$reformatted" +"%Y%m%d%H%M.%S"
     fi
 }
 
@@ -137,7 +141,13 @@ for f in "${file_list[@]}"; do
     exif_date=""
     for tag in "${date_tags[@]}"; do
         source_tag="$tag"
-        val=$(exiftool -m -s3 -$tag -d "%y%m%d%H%M%S" "$f")
+
+        val=$(exiftool -m -s3 -$tag -d "%y%m%d%H%M%S" "$f" 2>>"$log_file")
+        if [ $? -ne 0 ]; then
+            ((failures++))
+            print_failure "$processed/$total_files failure: exiftool read failed for '$basename_f'"
+            continue
+        fi
         if [[ "$val" =~ ^[0-9]{12}$ ]] && [[ "$val" != "000000000000" ]]; then
             exif_date="$val"
             break
@@ -179,7 +189,18 @@ for f in "${file_list[@]}"; do
             -DateTimeOriginal="$formatted_date" \
             -CreateDate="$formatted_date" \
             -FileCreateDate="$formatted_date" \
-            "$f" > /dev/null 2>&1
+            -ModifyDate="$formatted_date" \
+            -TrackCreateDate="$formatted_date" \
+            -TrackModifyDate="$formatted_date" \
+            -MediaCreateDate="$formatted_date" \
+            "$f" >>"$log_file" 2>&1
+
+            if [ $? -ne 0 ]; then
+                ((failures++))
+                print_failure "$processed/$total_files failure: exiftool metadata update failed for '$basename_f'"
+                continue
+            fi
+
     else
         exiftool -overwrite_original \
             -trailer:all= \
@@ -216,12 +237,20 @@ for f in "${file_list[@]}"; do
         exiftool -overwrite_original \
             -TrackCreateDate="$formatted_date" \
             -TrackModifyDate="$formatted_date" \
-            "$newfile" > /dev/null 2>&1
+            -MediaCreateDate="$formatted_date" \
+            -MediaModifyDate="$formatted_date" \
+            "$newfile" >>"$log_file" 2>&1
+
+        if [ $? -ne 0 ]; then
+            ((failures++))
+            print_failure "$processed/$total_files failure: exiftool metadata update failed for '$newfile'"
+            continue
+        fi
 
         # --- Remet File Modification Date au formatted_date ---
         # Conversion en format attendu par `touch`
         touch_date=$(format_touch_date "$formatted_date")
-        touch -t "$touch_date" "$newfile"
+        touch -a -m -t "$touch_date" "$newfile"
 
         echo "mv -v \"$newfile\" \"$f\"" >> "$undo_script"
         ((success++))
