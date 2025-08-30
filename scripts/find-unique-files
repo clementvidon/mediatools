@@ -1,0 +1,33 @@
+#!/bin/bash
+
+dir1="$1"
+dir2="$2"
+
+if [ -z "$dir1" ] || [ -z "$dir2" ]; then
+  echo "Usage: $0 <dir1> <dir2>"
+  exit 1
+fi
+
+mkdir -p "$dir1/unique"
+echo "create $dir1/unique"
+mkdir -p "$dir2/unique"
+echo "create $dir2/unique"
+
+for f in "$dir1"/*; do
+  [ -e "$f" ] || continue
+  name=$(basename "$f")
+  if [ ! -e "$dir2/$name" ]; then
+    cp -r "$f" "$dir1/unique/"
+    echo "$name added to $dir1/unique"
+  fi
+done
+
+for f in "$dir2"/*; do
+  [ -e "$f" ] || continue
+  name=$(basename "$f")
+  if [ ! -e "$dir1/$name" ]; then
+    cp -r "$f" "$dir2/unique/"
+    echo "$name added to $dir2/unique"
+  fi
+done
+
