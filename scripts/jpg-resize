@@ -1,43 +1,202 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -u
+set -o pipefail
 
-# Create a directory for resized images if it doesn't exist
-mkdir -p resized_images
+###############################################################################
+# jpg-resize
+#
+# Resize one or more JPEG files proportionally.
+#
+# Usage:
+#   jpg-resize width|height|longest PIXELS FILE...
+#
+# Examples:
+#   jpg-resize longest 1080 test.jpg testb.jpg
+#   jpg-resize width 2000 image.jpg
+#   jpg-resize height 1200 *.jpg
+#
+# Output:
+#   longest1080_original.jpg
+#   width2000_original.jpg
+#   height1200_original.jpg
+#
+# Notes:
+# - Original files are never overwritten.
+# - Output files are refused if they already exist.
+# - Uses high-quality Lanczos resizing.
+# - Outputs high-quality JPEG with 4:4:4 chroma sampling.
+# - Keeps metadata/profiles when ImageMagick can preserve them.
+###############################################################################
 
-# Loop through all JPG files in the current directory
-for img in *.jpg; do
-  # Check if the image size is greater than 2MB (2000000 bytes)
-  if [ $(stat -c%s "$img") -gt 2000000 ]; then
-    echo "Resizing $img..."
+usage() {
+    echo "Usage: $(basename "$0") width|height|longest PIXELS FILE..."
+    echo
+    echo "Examples:"
+    echo "  $(basename "$0") longest 1080 test.jpg testb.jpg"
+    echo "  $(basename "$0") width 2000 image.jpg"
+    echo "  $(basename "$0") height 1200 *.jpg"
+    exit 1
+}
 
-    # Set initial quality
-    quality=100
+if ! command -v magick >/dev/null 2>&1; then
+    echo "Error: ImageMagick is required."
+    echo "Install it with:"
+    echo "  sudo apt install imagemagick"
+    exit 1
+fi
 
-    # Start resizing the image
-    convert "$img" -quality $quality "resized_images/$img"
+if [ "$#" -lt 3 ]; then
+    usage
+fi
 
-    # Loop to reduce quality until the image is under 2MB
-    while [ $(stat -c%s "resized_images/$img") -gt 2000000 ]; do
-      # Reduce quality in steps of 5
-      quality=$((quality - 5))
+mode="$1"
+pixels="$2"
+shift 2
+files=("$@")
 
-      # Convert the image with the current quality setting
-      convert "$img" -quality $quality "resized_images/$img"
+case "$mode" in
+    width|height|longest)
+        ;;
+    *)
+        echo "Error: mode must be one of: width, height, longest"
+        usage
+        ;;
+esac
 
-      # Check if the quality is too low
-      if [ $quality -le 10 ]; then
-        echo "Warning: Unable to resize $img to under 2MB without reducing quality too much."
-        break
-      fi
-    done
+if [[ ! "$pixels" =~ ^[1-9][0-9]*$ ]]; then
+    echo "Error: PIXELS must be a positive integer."
+    exit 1
+fi
 
-    # Output the final size and quality used
-    echo "$img resized to $(stat -c%s "resized_images/$img") bytes using quality $quality."
-  else
-    # Copy images that are already under 2MB without modification
-    cp "$img" "resized_images/$img"
-    echo "$img is already under 2MB, copied without changes."
-  fi
+resize_geometry() {
+    case "$mode" in
+        width)
+            echo "${pixels}x"
+            ;;
+        height)
+            echo "x${pixels}"
+            ;;
+        longest)
+            echo "${pixels}x${pixels}"
+            ;;
+    esac
+}
+
+expected_ok() {
+    local width="$1"
+    local height="$2"
+
+    case "$mode" in
+        width)
+            [ "$width" -eq "$pixels" ]
+            ;;
+        height)
+            [ "$height" -eq "$pixels" ]
+            ;;
+        longest)
+            [ "$width" -eq "$pixels" ] || [ "$height" -eq "$pixels" ]
+            ;;
+    esac
+}
+
+geometry="$(resize_geometry)"
+
+total="${#files[@]}"
+processed=0
+success=0
+failed=0
+
+for input in "${files[@]}"; do
+    ((processed++))
+
+    if [ ! -f "$input" ]; then
+        ((failed++))
+        echo "[$processed/$total] FAIL: not a file: $input"
+        continue
+    fi
+
+    if [ ! -r "$input" ]; then
+        ((failed++))
+        echo "[$processed/$total] FAIL: not readable: $input"
+        continue
+    fi
+
+    ext="${input##*.}"
+    ext_lc="${ext,,}"
+
+    case "$ext_lc" in
+        jpg|jpeg)
+            ;;
+        *)
+            ((failed++))
+            echo "[$processed/$total] FAIL: not a JPEG file: $input"
+            continue
+            ;;
+    esac
+
+    dir="$(dirname "$input")"
+    base="$(basename "$input")"
+    name="${base%.*}"
+
+    output="$dir/${mode}${pixels}_${name}.jpg"
+
+    if [ -e "$output" ]; then
+        ((failed++))
+        echo "[$processed/$total] FAIL: output already exists: $output"
+        continue
+    fi
+
+    printf "\r\033[K[%d/%d] resizing: %s -> %s" \
+        "$processed" "$total" "$base" "$(basename "$output")"
+
+    if ! magick "$input" \
+        -auto-orient \
+        -filter Lanczos \
+        -resize "$geometry" \
+        -sampling-factor 4:4:4 \
+        -quality 95 \
+        -define jpeg:optimize-coding=true \
+        -define jpeg:dct-method=float \
+        "$output"; then
+
+        ((failed++))
+        echo
+        echo "[$processed/$total] FAIL: resize failed: $input"
+        rm -f "$output"
+        continue
+    fi
+
+    dimensions="$(magick identify -format '%w %h' "$output" 2>/dev/null || true)"
+    width="${dimensions%% *}"
+    height="${dimensions##* }"
+
+    if ! [[ "$width" =~ ^[0-9]+$ && "$height" =~ ^[0-9]+$ ]]; then
+        ((failed++))
+        echo
+        echo "[$processed/$total] FAIL: could not verify output dimensions: $output"
+        rm -f "$output"
+        continue
+    fi
+
+    if ! expected_ok "$width" "$height"; then
+        ((failed++))
+        echo
+        echo "[$processed/$total] FAIL: unexpected dimensions: ${width}x${height}: $output"
+        rm -f "$output"
+        continue
+    fi
+
+    ((success++))
+    printf "\r\033[K[%d/%d] ok: %s -> %s (%sx%s)\n" \
+        "$processed" "$total" "$base" "$(basename "$output")" "$width" "$height"
 done
 
-echo "Resizing process completed."
+echo
+echo "Done."
+echo "Processed: $processed"
+echo "Created: $success"
+echo "Failed: $failed"
 
+if [ "$failed" -gt 0 ]; then
+    exit 1
+fi

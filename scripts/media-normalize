@@ -1,0 +1,510 @@
+#!/usr/bin/env bash
+
+###############################################################################
+# media-ingest
+#
+# Ingest media files from the current directory:
+# - read best available creation date
+# - rebuild useful photographer metadata for regular image files
+# - preserve RAW/video metadata more conservatively
+# - normalize dates
+# - rename files using date + file size
+# - generate a filename-only undo script
+#
+# Usage:
+#   media-ingest PREFIX
+#
+# Example:
+#   media-ingest PHONE_CV
+#
+# Supported extensions:
+#   jpg jpeg heic png webp gif dng mov mp4 3gp
+#
+# Tested target:
+#   GNU/Linux / Ubuntu
+###############################################################################
+
+set -u
+set -o pipefail
+
+###############################################################################
+# 1) Dependencies and arguments
+###############################################################################
+
+if ! command -v exiftool >/dev/null 2>&1; then
+    echo "Error: exiftool is required but not installed."
+    exit 1
+fi
+
+if ! command -v realpath >/dev/null 2>&1; then
+    echo "Error: realpath is required but not installed."
+    exit 1
+fi
+
+usage() {
+    echo "Usage: $(basename "$0") PREFIX"
+    echo
+    echo "Example:"
+    echo "  $(basename "$0") PHONE_CV"
+    echo
+    echo "The script processes supported media files in the current directory only."
+    exit 1
+}
+
+if [ "$#" -ne 1 ]; then
+    usage
+fi
+
+prefix="$1"
+target_dir="."
+
+if [[ ! "$prefix" =~ ^[A-Za-z0-9_-]+$ ]]; then
+    echo "Error: prefix must contain only letters, numbers, underscores, or dashes."
+    exit 1
+fi
+
+if [[ "$(uname)" != "Linux" ]]; then
+    echo "Error: this script is intended for GNU/Linux."
+    exit 1
+fi
+
+###############################################################################
+# 2) Helpers
+###############################################################################
+
+get_file_size() {
+    stat -c%s "$1"
+}
+
+get_file_mtime_epoch() {
+    stat -c "%Y" "$1"
+}
+
+format_epoch_date() {
+    local epoch="$1"
+    date -d "@$epoch" +"%Y%m%d%H%M%S"
+}
+
+format_touch_date() {
+    local input="$1"
+    local date_part="${input%% *}"
+    local time_part="${input##* }"
+    local date_part_clean="${date_part//:/-}"
+    local reformatted="${date_part_clean} ${time_part}"
+
+    date -d "$reformatted" +"%Y%m%d%H%M.%S"
+}
+
+lower_ext() {
+    local file="$1"
+    local ext="${file##*.}"
+    printf '%s' "${ext,,}"
+}
+
+is_video_ext() {
+    case "$1" in
+        mov|mp4|3gp) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+is_raw_ext() {
+    case "$1" in
+        dng) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+###############################################################################
+# 3) Logging
+###############################################################################
+
+run_id="$(date +"%y%m%d%H%M%S")_$$"
+log_file="/tmp/media-ingest_${run_id}.log"
+undo_script="/tmp/media-ingest-undo_${run_id}.sh"
+
+echo "media-ingest started: $(date)" > "$log_file"
+
+{
+    echo "#!/usr/bin/env bash"
+    echo "set -u"
+    echo
+    echo "# media-ingest undo script"
+    echo "# Run id: $run_id"
+    echo "#"
+    echo "# WARNING:"
+    echo "# This undo script restores filenames only."
+    echo "# It does not restore original metadata."
+    echo
+} > "$undo_script"
+
+chmod +x "$undo_script"
+
+log() {
+    echo "[$(date '+%H:%M:%S')] $*" >> "$log_file"
+}
+
+print_status() {
+    local processed="$1"
+    local total="$2"
+    local ok="$3"
+    local skipped="$4"
+    local failed="$5"
+    local action="$6"
+
+    printf "\r\033[K[%d/%d] ok:%d skipped:%d failed:%d | %s" \
+        "$processed" "$total" "$ok" "$skipped" "$failed" "$action"
+}
+
+print_failure() {
+    echo
+    echo -e "\033[31m$1\033[0m"
+}
+
+###############################################################################
+# 4) File collection
+###############################################################################
+
+supported_exts=(
+    jpg jpeg heic png webp gif dng mov mp4 3gp
+)
+
+find_expr=()
+for ext in "${supported_exts[@]}"; do
+    if [ "${#find_expr[@]}" -gt 0 ]; then
+        find_expr+=(-o)
+    fi
+    find_expr+=(-iname "*.$ext")
+done
+
+file_list=()
+while IFS= read -r -d '' file; do
+    file_list+=("$file")
+done < <(
+    find "$target_dir" \
+        -maxdepth 1 \
+        -type f \
+        ! -name '.*' \
+        \( "${find_expr[@]}" \) \
+        -print0 | sort -z
+)
+
+###############################################################################
+# 5) Metadata helpers
+###############################################################################
+
+read_best_date() {
+    local file="$1"
+    local val=""
+    local tag=""
+
+    local date_tags=(
+        DateTimeOriginal
+        CreateDate
+        MediaCreateDate
+        ModifyDate
+    )
+
+    for tag in "${date_tags[@]}"; do
+        val=$(exiftool -m -s3 -"$tag" -d "%Y%m%d%H%M%S" "$file" 2>>"$log_file")
+        val="${val%%$'\n'*}"
+
+        if [[ "$val" =~ ^[0-9]{14}$ ]] && [[ "$val" != "00000000000000" ]]; then
+            echo "$val|$tag"
+            return 0
+        fi
+    done
+
+    local file_epoch
+    file_epoch=$(get_file_mtime_epoch "$file")
+    echo "$(format_epoch_date "$file_epoch")|file_mtime"
+}
+
+write_basic_metadata_preserving_existing() {
+    local file="$1"
+    local formatted_date="$2"
+    local sanitized_name="$3"
+
+    local metadata_args=(
+        -overwrite_original
+        -m
+
+        -DateTimeOriginal="$formatted_date"
+        -CreateDate="$formatted_date"
+        -ModifyDate="$formatted_date"
+        -MediaCreateDate="$formatted_date"
+        -MediaModifyDate="$formatted_date"
+        -TrackCreateDate="$formatted_date"
+        -TrackModifyDate="$formatted_date"
+    )
+
+    if ! exiftool -UserComment "$file" 2>/dev/null | grep -q "originalfilename"; then
+        metadata_args+=(-UserComment="originalfilename_$(date +%y%m%d)=$sanitized_name")
+    fi
+
+    exiftool "${metadata_args[@]}" "$file" >>"$log_file" 2>&1
+}
+
+rebuild_photographer_metadata() {
+    local file="$1"
+    local formatted_date="$2"
+    local sanitized_name="$3"
+
+    local metadata_args=(
+        -overwrite_original
+        -m
+
+        # Destructive metadata cleanup.
+        -all=
+
+        # Reinject only useful photographer metadata from the original file.
+        -tagsFromFile @
+
+        # File / origin.
+        -Make
+        -Model
+        -Software
+        -Artist
+        -Copyright
+
+        # Lens.
+        -LensMake
+        -LensModel
+        -LensInfo
+
+        # Exposure / capture settings.
+        -ExposureTime
+        -FNumber
+        -ISO
+        -PhotographicSensitivity
+        -ExposureProgram
+        -ExposureMode
+        -ExposureCompensation
+        -MeteringMode
+        -LightSource
+        -WhiteBalance
+        -Flash
+
+        # Focal information.
+        -FocalLength
+        -FocalLengthIn35mmFormat
+        -DigitalZoomRatio
+
+        # Dates, time zones, subseconds.
+        -DateTimeOriginal
+        -CreateDate
+        -ModifyDate
+        -OffsetTime
+        -OffsetTimeOriginal
+        -OffsetTimeDigitized
+        -SubSecTime
+        -SubSecTimeOriginal
+        -SubSecTimeDigitized
+
+        # Orientation / resolution.
+        -Orientation
+        -XResolution
+        -YResolution
+        -ResolutionUnit
+
+        # Color.
+        -ColorSpace
+        -ICC_Profile
+
+        # Curation / annotation.
+        -ImageDescription
+        -Title
+        -Description
+        -Caption-Abstract
+        -Keywords
+        -Subject
+        -Rating
+        -Label
+
+        # Existing workflow metadata, if present.
+        -UserComment
+
+        # GPS is intentionally kept for personal archive workflow.
+        -GPS:all
+
+        # Exclude fragile/heavy/proprietary blocks.
+        --MakerNotes:all
+        --PreviewImage
+        --ThumbnailImage
+        --OtherImageStart
+        --OtherImageLength
+        --JpgFromRaw
+        --OriginalRawFileName
+        --OriginalRawFileData
+        --Photoshop:all
+        --trailer:all
+
+        # Force normalized dates.
+        -DateTimeOriginal="$formatted_date"
+        -CreateDate="$formatted_date"
+        -ModifyDate="$formatted_date"
+        -MediaCreateDate="$formatted_date"
+        -MediaModifyDate="$formatted_date"
+        -TrackCreateDate="$formatted_date"
+        -TrackModifyDate="$formatted_date"
+
+        # Remove trailers/residual garbage again after rebuild.
+        -trailer:all=
+    )
+
+    if ! exiftool -UserComment "$file" 2>/dev/null | grep -q "originalfilename"; then
+        metadata_args+=(-UserComment="originalfilename_$(date +%y%m%d)=$sanitized_name")
+    fi
+
+    exiftool "${metadata_args[@]}" "$file" >>"$log_file" 2>&1
+}
+
+process_metadata() {
+    local file="$1"
+    local ext="$2"
+    local formatted_date="$3"
+    local sanitized_name="$4"
+
+    if is_raw_ext "$ext"; then
+        # DNG/RAW files are preserved more conservatively.
+        # No -all= rebuild here: RAW/DNG metadata may contain image-critical tags.
+        write_basic_metadata_preserving_existing "$file" "$formatted_date" "$sanitized_name"
+        return $?
+    fi
+
+    if is_video_ext "$ext"; then
+        # Videos keep their existing container metadata.
+        # This avoids stripping rotation/location/container-specific data.
+        write_basic_metadata_preserving_existing "$file" "$formatted_date" "$sanitized_name"
+        return $?
+    fi
+
+    # Regular image files get the controlled metadata rebuild.
+    rebuild_photographer_metadata "$file" "$formatted_date" "$sanitized_name"
+}
+
+###############################################################################
+# 6) Main
+###############################################################################
+
+total_files=${#file_list[@]}
+processed=0
+success=0
+skipped=0
+failures=0
+
+log "directory: $(pwd)"
+log "prefix: $prefix"
+log "total files: $total_files"
+
+if [ "$total_files" -eq 0 ]; then
+    echo "No supported media files found in current directory."
+    echo "Supported: ${supported_exts[*]}"
+    exit 0
+fi
+
+echo "media-ingest"
+echo "Directory: $(pwd)"
+echo "Prefix: $prefix"
+echo "Files: $total_files"
+echo
+
+for f in "${file_list[@]}"; do
+    ((processed++))
+
+    basename_f=$(basename "$f")
+    ext="$(lower_ext "$f")"
+
+    if [ ! -r "$f" ] || [ ! -s "$f" ] || [ ! -w "$f" ]; then
+        ((failures++))
+        print_status "$processed" "$total_files" "$success" "$skipped" "$failures" "fail: $basename_f"
+        print_failure "$processed/$total_files failure: unreadable, empty, or not writable: '$basename_f'"
+        log "$processed/$total_files failure: unreadable, empty, or not writable: $basename_f"
+        continue
+    fi
+
+    date_result=$(read_best_date "$f")
+    exif_date="${date_result%%|*}"
+    source_tag="${date_result##*|}"
+
+    year="${exif_date:0:4}"
+    yy="${exif_date:2:2}"
+    month="${exif_date:4:2}"
+    day="${exif_date:6:2}"
+    hour="${exif_date:8:2}"
+    min="${exif_date:10:2}"
+    sec="${exif_date:12:2}"
+
+    formatted_date="${year}:${month}:${day} ${hour}:${min}:${sec}"
+
+    sanitized_name="$(printf '%s' "$basename_f" \
+        | tr -cd '[:print:]' \
+        | tr '\t' ' ' \
+        | sed 's/[^a-zA-Z0-9._-]/_/g' \
+        | cut -c1-200)"
+
+    print_status "$processed" "$total_files" "$success" "$skipped" "$failures" "metadata: $basename_f"
+
+    if ! process_metadata "$f" "$ext" "$formatted_date" "$sanitized_name"; then
+        ((failures++))
+        print_status "$processed" "$total_files" "$success" "$skipped" "$failures" "fail metadata: $basename_f"
+        print_failure "$processed/$total_files failure: metadata update failed: '$basename_f'"
+        log "$processed/$total_files failure: metadata update failed: $basename_f"
+        continue
+    fi
+
+    bytes=$(printf "%08d" "$(get_file_size "$f")")
+    ext_upper="${ext^^}"
+    newfile="$target_dir/${prefix}${yy}_${month}${day}_${hour}${min}${sec}_${bytes}.${ext_upper}"
+    newbase=$(basename "$newfile")
+
+    if [ "$(realpath "$f")" = "$(realpath -m "$newfile")" ]; then
+        touch_date=$(format_touch_date "$formatted_date")
+        touch -a -m -t "$touch_date" "$f"
+
+        ((skipped++))
+        print_status "$processed" "$total_files" "$success" "$skipped" "$failures" "already: $basename_f"
+        log "$processed/$total_files already named: $basename_f | date source: $source_tag"
+        continue
+    fi
+
+    if [ -e "$newfile" ]; then
+        ((failures++))
+        print_status "$processed" "$total_files" "$success" "$skipped" "$failures" "collision: $newbase"
+        print_failure "$processed/$total_files failure: target already exists: '$newbase'"
+        log "$processed/$total_files failure: target exists: $newfile"
+        continue
+    fi
+
+    print_status "$processed" "$total_files" "$success" "$skipped" "$failures" "rename: $basename_f -> $newbase"
+
+    if mv "$f" "$newfile" >>"$log_file" 2>&1; then
+        touch_date=$(format_touch_date "$formatted_date")
+        touch -a -m -t "$touch_date" "$newfile"
+
+        printf 'mv -vn %q %q\n' "$newfile" "$f" >> "$undo_script"
+
+        ((success++))
+        print_status "$processed" "$total_files" "$success" "$skipped" "$failures" "renamed: $basename_f -> $newbase"
+        log "$processed/$total_files success: $basename_f -> $newbase | date source: $source_tag"
+    else
+        ((failures++))
+        print_status "$processed" "$total_files" "$success" "$skipped" "$failures" "fail rename: $basename_f"
+        print_failure "$processed/$total_files failure: could not rename: '$basename_f'"
+        log "$processed/$total_files failure: mv failed: $basename_f"
+    fi
+done
+
+echo
+echo
+echo "Done."
+echo "Processed: $processed"
+echo "Renamed: $success"
+echo "Already named: $skipped"
+echo "Failed: $failures"
+echo "Log: $log_file"
+echo "Undo: $undo_script"
+
+if [ "$failures" -gt 0 ]; then
+    exit 1
+fi

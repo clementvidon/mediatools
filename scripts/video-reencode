@@ -1,60 +1,154 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -u
+set -o pipefail
 
-# Define the output path for the re-encoded files and the log file
-output_path="/tmp/reencode"
-LOGFILE="/tmp/reencode.log"
-mkdir -p "$output_path"
+###############################################################################
+# video-reencode
+#
+# Re-encode video files to fresh H.264/AAC MP4 files.
+#
+# Usage:
+#   video-reencode FILE...
+#
+# Output:
+#   /tmp/reencode/reencoded_<original-name>.mp4
+#
+# Notes:
+# - Original files are never overwritten.
+# - This is a recovery/normalization tool, not a guaranteed repair.
+###############################################################################
 
-# Log starting message
-echo "Starting reencode..." | tee -a "$LOGFILE"
+OUTPUT_DIR="/tmp/reencode"
+LOGFILE="/tmp/video-reencode_$(date +%y%m%d%H%M%S)_$$.log"
 
-# Check if video files are provided as arguments, otherwise exit
-if [ "$#" -eq 0 ]; then
-    echo "No video files provided. Please provide video files as arguments."
+mkdir -p "$OUTPUT_DIR"
+
+usage() {
+    echo "Usage: $(basename "$0") FILE..."
     exit 1
+}
+
+log() {
+    echo "[$(date '+%H:%M:%S')] $*" >> "$LOGFILE"
+}
+
+need() {
+    if ! command -v "$1" >/dev/null 2>&1; then
+        echo "Error: missing dependency: $1"
+        exit 1
+    fi
+}
+
+need ffmpeg
+need ffprobe
+
+if [ "$#" -eq 0 ]; then
+    usage
 fi
 
-# Function to display progress
-show_progress() {
-    printf "\rProcessing: %d/%d" "$1" "$2"
-}
+total="$#"
+processed=0
+success=0
+failed=0
+skipped=0
 
-# Function for logging with timestamp
-log() {
-    echo "[$(date '+%H:%M')] $1" >> "$LOGFILE"
-}
+echo "video-reencode"
+echo "Output: $OUTPUT_DIR"
+echo "Log: $LOGFILE"
+echo
 
-# Total number of files to process
-total_files=$#
-current_file=0
-
-# Iterate over all video files passed as arguments
 for file in "$@"; do
-    # Check if the file exists and is a valid file
-    if [ ! -e "$file" ] || ! ffmpeg -v error -i "$file" &>/dev/null; then
-        log "ERROR: '$file' does not exist or is not a valid video file. Skipping."
+    ((processed++))
+
+    base="$(basename "$file")"
+    name="${base%.*}"
+    output="$OUTPUT_DIR/reencoded_${name}.mp4"
+
+    printf "\r\033[K[%d/%d] checking: %s" "$processed" "$total" "$base"
+
+    if [ ! -f "$file" ]; then
+        ((skipped++))
+        echo
+        echo "SKIP: not a file: $file"
+        log "SKIP not a file: $file"
         continue
     fi
 
-    # Increment the current file counter
-    ((current_file++))
-
-    # Define the output file path in the output directory (output re-encoded file will be in .MOV format)
-    output_reencoded="$output_path/$(basename "${file%.*}").MOV"
-
-    # Print progress
-    show_progress "$current_file" "$total_files"
-
-    # Re-encode the file using FFmpeg
-    ffmpeg -loglevel quiet -i "$file" -vf "setpts=PTS-STARTPTS" -af "asetpts=PTS-STARTPTS" -c:v libx264 -c:a aac "$output_reencoded" >> "$LOGFILE" 2>&1
-
-    # Check if the re-encoding was successful
-    if [ $? -eq 0 ]; then
-        echo -e "\nSuccessfully re-encoded: $file -> $output_reencoded" | tee -a "$LOGFILE"
-    else
-        echo -e "\nFailed to re-encode: $file. See the log for details." | tee -a "$LOGFILE"
+    if [ ! -r "$file" ]; then
+        ((skipped++))
+        echo
+        echo "SKIP: not readable: $file"
+        log "SKIP not readable: $file"
+        continue
     fi
+
+    if ! ffprobe -v error -show_format -show_streams "$file" >>"$LOGFILE" 2>&1; then
+        ((failed++))
+        echo
+        echo "FAIL: cannot read video container: $file"
+        log "FAIL ffprobe input: $file"
+        continue
+    fi
+
+    if [ -e "$output" ]; then
+        ((failed++))
+        echo
+        echo "FAIL: output already exists: $output"
+        log "FAIL output exists: $output"
+        continue
+    fi
+
+    printf "\r\033[K[%d/%d] reencoding: %s -> %s" "$processed" "$total" "$base" "$(basename "$output")"
+
+    if ! ffmpeg -hide_banner -y \
+        -v warning \
+        -i "$file" \
+        -map 0:v:0 \
+        -map 0:a? \
+        -vf "setpts=PTS-STARTPTS" \
+        -af "asetpts=PTS-STARTPTS" \
+        -c:v libx264 \
+        -preset slow \
+        -crf 18 \
+        -pix_fmt yuv420p \
+        -c:a aac \
+        -b:a 192k \
+        -movflags +faststart \
+        "$output" >>"$LOGFILE" 2>&1; then
+
+        ((failed++))
+        echo
+        echo "FAIL: reencode failed: $file"
+        log "FAIL reencode: $file"
+        rm -f "$output"
+        continue
+    fi
+
+    printf "\r\033[K[%d/%d] verifying: %s" "$processed" "$total" "$(basename "$output")"
+
+    if ! ffprobe -v error -show_format -show_streams "$output" >>"$LOGFILE" 2>&1; then
+        ((failed++))
+        echo
+        echo "FAIL: output verification failed: $output"
+        log "FAIL ffprobe output: $output"
+        rm -f "$output"
+        continue
+    fi
+
+    ((success++))
+    printf "\r\033[K[%d/%d] ok: %s -> %s\n" "$processed" "$total" "$base" "$(basename "$output")"
+    log "OK: $file -> $output"
 done
 
-# Print completion message
-echo "All files processed: $current_file/$total_files completed.\nSee $output_path" | tee -a "$LOGFILE"
+echo
+echo "Done."
+echo "Processed: $processed"
+echo "Created: $success"
+echo "Skipped: $skipped"
+echo "Failed: $failed"
+echo "Output: $OUTPUT_DIR"
+echo "Log: $LOGFILE"
+
+if [ "$failed" -gt 0 ]; then
+    exit 1
+fi

@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+set -u
+set -o pipefail
+
+usage() {
+    echo "Usage: $(basename "$0") DIR1 DIR2"
+    echo
+    echo "Find files whose names exist in one directory but not the other."
+    echo "Comparison is by filename only, not by file content."
+    exit 1
+}
+
+if [ "$#" -ne 2 ]; then
+    usage
+fi
+
+dir1="${1%/}"
+dir2="${2%/}"
+
+if [ ! -d "$dir1" ]; then
+    echo "Error: not a directory: $dir1"
+    exit 1
+fi
+
+if [ ! -d "$dir2" ]; then
+    echo "Error: not a directory: $dir2"
+    exit 1
+fi
+
+outdir="$(mktemp -d /tmp/dir-name-diff.XXXXXX)"
+unique1="$outdir/dir1_only"
+unique2="$outdir/dir2_only"
+
+mkdir -p "$unique1" "$unique2"
+
+count1=0
+count2=0
+
+echo "Comparing by filename only:"
+echo "DIR1: $dir1"
+echo "DIR2: $dir2"
+echo
+
+while IFS= read -r -d '' file; do
+    name="$(basename "$file")"
+
+    if [ ! -e "$dir2/$name" ]; then
+        cp -p "$file" "$unique1/"
+        ((count1++))
+        printf "\rDIR1 only: %d | DIR2 only: %d" "$count1" "$count2"
+    fi
+done < <(find "$dir1" -maxdepth 1 -type f ! -name '.*' -print0 | sort -z)
+
+while IFS= read -r -d '' file; do
+    name="$(basename "$file")"
+
+    if [ ! -e "$dir1/$name" ]; then
+        cp -p "$file" "$unique2/"
+        ((count2++))
+        printf "\rDIR1 only: %d | DIR2 only: %d" "$count1" "$count2"
+    fi
+done < <(find "$dir2" -maxdepth 1 -type f ! -name '.*' -print0 | sort -z)
+
+echo
+echo
+echo "Done."
+echo "DIR1-only files: $count1"
+echo "DIR2-only files: $count2"
+echo "Output: $outdir"
+echo "DIR1-only copied to: $unique1"
+echo "DIR2-only copied to: $unique2"

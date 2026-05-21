@@ -1,0 +1,237 @@
+#!/usr/bin/env bash
+set -u
+set -o pipefail
+
+MODE="${1:-}"
+LOGFILE="/tmp/media-sanity-check_$(date +%y%m%d%H%M%S)_$$.log"
+TMPDIR="$(mktemp -d /tmp/media-sanity-check.XXXXXX)"
+
+FILES_CHECKED=0
+FILES_FAILED=0
+CHECKS_RUN=0
+
+trap 'rm -rf "$TMPDIR"' EXIT
+
+usage() {
+    echo "Usage: $(basename "$0") fast|normal|deep"
+    echo
+    echo "Modes:"
+    echo "  fast    quick read-only checks; videos use ffprobe only"
+    echo "  normal  stronger image checks; videos decode only first 15 seconds"
+    echo "  deep    strongest checks; videos are fully decoded and may take time"
+    exit 1
+}
+
+log() {
+    echo "[$(date '+%H:%M:%S')] $*" >> "$LOGFILE"
+}
+
+need() {
+    if ! command -v "$1" >/dev/null 2>&1; then
+        echo "Missing dependency: $1"
+        log "ERROR: missing dependency: $1"
+        exit 1
+    fi
+}
+
+progress() {
+    local action="$1"
+    printf "\r\033[KFiles: %d | Failed: %d | Checks: %d | %s" \
+        "$FILES_CHECKED" "$FILES_FAILED" "$CHECKS_RUN" "$action"
+}
+
+run_check() {
+    local file="$1"
+    shift
+
+    local out="$TMPDIR/check.out"
+    ((CHECKS_RUN++))
+
+    if ! "$@" >"$out" 2>&1; then
+        log "FAIL: $file"
+        log "Command: $*"
+        cat "$out" >> "$LOGFILE"
+        echo >> "$LOGFILE"
+        return 1
+    fi
+
+    return 0
+}
+
+ext_of() {
+    local file="$1"
+    local ext="${file##*.}"
+    printf '%s' "${ext,,}"
+}
+
+check_metadata() {
+    local file="$1"
+    need exiftool
+    run_check "$file" exiftool -warning -error "$file"
+}
+
+check_file_by_type() {
+    local file="$1"
+    local ext="$2"
+
+    case "$ext" in
+        jpg|jpeg)
+            need jpeginfo
+            run_check "$file" jpeginfo -c "$file"
+            ;;
+
+        png)
+            need pngcheck
+            run_check "$file" pngcheck -q "$file"
+            ;;
+
+        webp)
+            if [ "$MODE" = "fast" ]; then
+                need webpinfo
+                run_check "$file" webpinfo "$file"
+            else
+                need dwebp
+                run_check "$file" dwebp "$file" -o /dev/null
+            fi
+            ;;
+
+        heic)
+            if [ "$MODE" = "fast" ]; then
+                need heif-info
+                run_check "$file" heif-info "$file"
+            else
+                need heif-convert
+                local out="$TMPDIR/heic-check.png"
+                run_check "$file" heif-convert "$file" "$out"
+                rm -f "$out"
+            fi
+            ;;
+
+        dng)
+            need dcraw
+            if [ "$MODE" = "deep" ]; then
+                run_check "$file" bash -c 'dcraw -c "$1" >/dev/null' _ "$file"
+            else
+                run_check "$file" dcraw -i "$file"
+            fi
+            ;;
+
+        gif)
+            if [ "$MODE" = "fast" ]; then
+                need ffprobe
+                run_check "$file" ffprobe -v error -show_format -show_streams "$file"
+            else
+                need ffmpeg
+                run_check "$file" ffmpeg -v error -xerror -i "$file" -f null -
+            fi
+            ;;
+
+        mp4|mov|3gp)
+            case "$MODE" in
+                fast)
+                    need ffprobe
+                    run_check "$file" ffprobe -v error -show_format -show_streams "$file"
+                    ;;
+                normal)
+                    need ffprobe
+                    run_check "$file" ffprobe -v error -show_format -show_streams "$file" || return 1
+
+                    need ffmpeg
+                    run_check "$file" ffmpeg -v error -xerror -t 15 -i "$file" -f null -
+                    ;;
+                deep)
+                    need ffmpeg
+                    run_check "$file" ffmpeg -v error -xerror -i "$file" -f null -
+                    ;;
+            esac
+            ;;
+
+        *)
+            log "SKIP unsupported extension: $file"
+            return 0
+            ;;
+    esac
+}
+
+if [ -z "$MODE" ]; then
+    usage
+fi
+
+case "$MODE" in
+    fast|normal|deep) ;;
+    *) usage ;;
+esac
+
+echo "Starting media sanity check: $(date)" > "$LOGFILE"
+log "Mode: $MODE"
+log "Directory: $(pwd)"
+
+supported_exts=(
+    jpg jpeg png webp heic dng gif mp4 mov 3gp
+)
+
+find_expr=()
+for ext in "${supported_exts[@]}"; do
+    if [ "${#find_expr[@]}" -gt 0 ]; then
+        find_expr+=(-o)
+    fi
+    find_expr+=(-iname "*.$ext")
+done
+
+file_list=()
+while IFS= read -r -d '' file; do
+    file_list+=("$file")
+done < <(
+    find . \
+        -maxdepth 1 \
+        -type f \
+        ! -name '.*' \
+        \( "${find_expr[@]}" \) \
+        -print0 | sort -z
+)
+
+total_files="${#file_list[@]}"
+
+if [ "$total_files" -eq 0 ]; then
+    echo "No supported media files found in current directory."
+    exit 0
+fi
+
+for file in "${file_list[@]}"; do
+    ext="$(ext_of "$file")"
+    base="$(basename "$file")"
+    failed_this_file=0
+
+    progress "checking: $base"
+
+    if ! check_metadata "$file"; then
+        failed_this_file=1
+    fi
+
+    if ! check_file_by_type "$file" "$ext"; then
+        failed_this_file=1
+    fi
+
+    ((FILES_CHECKED++))
+
+    if [ "$failed_this_file" -eq 1 ]; then
+        ((FILES_FAILED++))
+        echo
+        echo "FAIL: $base"
+        progress "failed: $base"
+    else
+        progress "ok: $base"
+    fi
+done
+
+echo
+echo "Media sanity check completed."
+echo "Mode: $MODE"
+echo "Files checked: $FILES_CHECKED"
+echo "Files failed: $FILES_FAILED"
+echo "Checks run: $CHECKS_RUN"
+echo "Log: $LOGFILE"
+
+if [ "$FILES_FAILED" -gt 0 ]; then
+    exit 1
+fi
